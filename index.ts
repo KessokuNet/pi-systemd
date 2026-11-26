@@ -4,6 +4,7 @@ import {
   type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { spawn } from "node:child_process";
 import { loadConfig, mergeProperties } from "./src/config.ts";
 import { SystemdUserBus } from "./src/dbus.ts";
 import {
@@ -39,7 +40,7 @@ const UPDATE_THROTTLE_MS = 100;
 
 export const GUIDANCE = `Long-running commands belong in systemd, not in bash.
 - Use bg with action "start" for builds, test suites, servers, anything that outlives the time you want to wait. It creates a transient systemd user unit; the work keeps running even if this session ends or is interrupted.
-- Read output with action "output" (add follow: true to wait for new lines until the unit exits). Poll less: prefer follow over repeated output calls.
+- start ends the turn. When the unit finishes, this session is woken with its exit status and the tail of its journal, so do not poll: only call output when you want more of the log than the wake carried, or with follow: true when you deliberately want to watch a unit that is still running.
 - Check with action "status", end with action "stop". Never kill these processes by PID or pattern; stop the unit.
 - Sandboxing, resource limits, and Exec hooks go in start's properties (e.g. NoNewPrivileges, ProtectSystem, MemoryMax, TasksMax, ExecStartPre). Names ending in …Sec are converted to the …USec property systemd's D-Bus API expects. Shared defaults live in the pi-systemd config file under properties, and named sets under presets, picked with the preset parameter.`;
 
@@ -220,6 +221,47 @@ export default function systemdBackground(pi: ExtensionAPI) {
     }
   };
 
+  /** Units already woken for, so a restart of the waiter never double-fires. */
+  const woken = new Set<string>();
+
+  /**
+   * Wake this session when a unit finishes, instead of leaving the caller to poll.
+   * `systemctl --user wait` blocks until the unit is inactive; its exit tells us
+   * when to look, and the unit's own state tells us how it went.
+   */
+  const wakeOnFinish = (unit: string, id: string, command: string): void => {
+    if (woken.has(unit)) return;
+    const child = spawn("systemctl", ["--user", "wait", unit], {
+      stdio: "ignore",
+    });
+    child.on("error", () => undefined);
+    child.on("close", () => {
+      woken.add(unit);
+      void (async () => {
+        const state = await stateOf(unit);
+        const { records } = await (await reader()).read(unit);
+        const { lines: tail } = renderOutput(
+          selectRecords(records, false),
+          20,
+        );
+        const exitCode = state?.exitCode ?? (state?.failed ? 1 : 0);
+        const verdict = state?.failed ? "failed" : "finished";
+        pi.sendMessage(
+          {
+            customType: "bg-finished",
+            display: true,
+            content: [
+              `bg ${id} ${verdict}: exit ${exitCode}`,
+              `$ ${command}`,
+              ...tail,
+            ].join("\n"),
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      })().catch(() => undefined);
+    });
+  };
+
   const waitForState = async (
     unit: string,
     what: "appears" | "stops",
@@ -353,6 +395,7 @@ export default function systemdBackground(pi: ExtensionAPI) {
         startedAt: new Date().toISOString(),
         properties: applied,
       });
+      wakeOnFinish(unit, id, command);
       const { records } = await (await reader()).read(unit);
       const selected = selectRecords(records, includeAll);
       const { lines: rendered, omitted } = renderOutput(selected, lines);
@@ -634,7 +677,7 @@ export default function systemdBackground(pi: ExtensionAPI) {
 ${GUIDANCE}
 Actions:
 - start: create a unit from a shell command (params: command, optional name, cwd, env, properties, preset).
-- output: read the unit's output; follow: true keeps streaming until it exits (optional timeout, default ${DEFAULT_FOLLOW_SECONDS}s).
+- output: read the unit's output; follow: true keeps streaming until it exits (optional timeout, default ${DEFAULT_FOLLOW_SECONDS}s). Not needed to learn that a unit finished: start wakes this session with the exit status and the tail of the journal.
 - status: state, command, cwd, start time, sandboxing properties.
 - stop: ask systemd to stop the unit, then report its final output.
 - list: units this tool has created.
